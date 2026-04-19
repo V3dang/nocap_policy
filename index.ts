@@ -1,37 +1,25 @@
 import express from "express";
 import multer from "multer";
-import { PDFParse } from "pdf-parse"; 
+// import { PDFParse } from "pdf-parse"; 
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import fs from 'fs'; 
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { ChromaClient } from "chromadb";
 import { pipeline } from '@xenova/transformers';
-import { ChatGroq } from "@langchain/groq"
 import { agent } from "./agents/agent_nodes"; 
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import 'dotenv/config';
 import { randomUUID } from "crypto";
+import { Redis } from "ioredis"
 
-const client = new ChromaClient();
+const redis = new Redis()
+
+const client = new ChromaClient({ path: "http://localhost:8000" });
 const upload = multer({ 'dest': 'uploads/' })
 
 const app = express();
 app.use(express.json());
 const port = 8080;
-
-type SessionState = {
-  collectionName: string;
-  messages: Array<HumanMessage | AIMessage>;
-  contextDocs: Map<string, string>;
-};
-
-const sessions = new Map<string, SessionState>();
-
-const llm = new ChatGroq({
-    model: "llama-3.3-70b-versatile",
-    temperature: 0,
-    maxTokens: undefined,
-    maxRetries: 2,
-})
 
 let extractor: any;
 async function loadModel() {
@@ -48,16 +36,16 @@ app.post("/api/upload", upload.single('policy'), async (req, res) => {
   if (!req.file) {
     return res.status(400).send('Policy not uploaded');
   }
-  const databuffer = new Uint8Array(fs.readFileSync(req.file.path));
-  const data = new PDFParse(databuffer);
-  const text = await data.getText();
+  const sessionId: string = randomUUID();
+  const loader = new PDFLoader(req.file.path);
+  const rawDocs = await loader.load();
   const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 })
-  const chunks = await splitter.createDocuments([text.text])
+  const chunks = await splitter.splitDocuments(rawDocs)
 
   const ids: string[] = []
   const embeddings: number[][] = []
   const documents: string[] = []
-  const metadatas: Array<{ source: string }> = []
+  const metadatas: Array<{ source: string, sessionId: string }> = []
   
   for (let i = 0; i < chunks.length; i++){
     const chunkText = chunks[i]?.pageContent
@@ -65,15 +53,14 @@ app.post("/api/upload", upload.single('policy'), async (req, res) => {
     const output = await extractor(chunkText, { pooling: 'mean', normalize: true });
     const vector = Array.from(output.data) as number[];
     
-    ids.push(`${req.file.filename}-chunk-${i}`);
+    ids.push(`${sessionId}-chunk-${i}`);
     embeddings.push(vector);
     documents.push(chunkText);
-    metadatas.push({ source: req.file.originalname });
+    metadatas.push({ source: req.file.originalname, sessionId: sessionId });
   }
   
-  const sessionId = randomUUID();
-  const collectionName = `nocap_policy_${sessionId}`;
-  const collection = await client.createCollection({
+  const collectionName = `nocap_policy`;
+  const collection = await client.getOrCreateCollection({
     name: collectionName,
   });
   
@@ -84,16 +71,17 @@ app.post("/api/upload", upload.single('policy'), async (req, res) => {
     metadatas: metadatas
   })
   
-  sessions.set(sessionId, {
-    collectionName,
-    messages: [],
-    contextDocs: new Map<string, string>(),
-  });
-
+  const initialSessionData = {
+    sessionId: sessionId,
+    messages: []
+  };
+  
+  await redis.set(sessionId, JSON.stringify(initialSessionData), 'EX', 60 * 60 * 24 * 7); 
+  
   res.json({
+    message: "W",
     sessionId,
     totalChunks: chunks.length,
-    sampleChunk: chunks[0]
   })
 });
 
@@ -101,29 +89,27 @@ app.post("/api/ask", async (req, res) => {
   const { qs, sessionId } = req.body
   if (!qs) return res.status(400).send("Provide a message dawg")
   if (!sessionId) return res.status(400).send("Provide a sessionId")
-  const session = sessions.get(sessionId)
-  if (!session) return res.status(404).send("Session not found")
+  const sessionString = await redis.get(sessionId);
+  if (!sessionString) return res.status(404).send("Session not found or expired");
   
+  const session = JSON.parse(sessionString);
   const output = await extractor(qs, { pooling: 'mean', normalize: true });
   const queryEmbedding = Array.from(output.data) as number[];
   
-  const collection = await client.getOrCreateCollection({ name: session.collectionName });
+  const collection = await client.getCollection({ name: "nocap_policy" });
   const results = await collection.query({
     queryEmbeddings: [queryEmbedding],
     nResults: 3, 
+    where: { "sessionId": sessionId }
   });
 
-  const resultDocs = (results.documents[0] ?? []) as string[];
-  const resultIds = (results.ids[0] ?? []) as string[];
-  for (let i = 0; i < resultDocs.length; i++) {
-    const docId = resultIds[i];
-    const docText = resultDocs[i];
-    if (docId && docText) {
-      session.contextDocs.set(docId, docText);
-    }
-  }
-  const retrievedContext = Array.from(session.contextDocs.values()).join("\n\n");
-  const nextMessages = [...session.messages, new HumanMessage(qs)];
+  const retrievedContext = results.documents[0]?.join("\n\n") || "No relevant info found.";
+  const hydratedMessages = session.messages.map((msg: any) => {
+    return msg.role === "user" 
+    ? new HumanMessage(msg.content) 
+    : new AIMessage(msg.content);
+  });
+  const nextMessages = [...hydratedMessages, new HumanMessage(qs)];
   const finalState = await agent.invoke({
     messages: nextMessages,
     context: retrievedContext
@@ -133,7 +119,18 @@ app.post("/api/ask", async (req, res) => {
   if (!finalMessage) {
     return res.status(500).send("No response generated")
   }
-  session.messages = [...nextMessages, new AIMessage(finalMessage.content as string)];
+  
+  const updatedMessages = [
+    ...session.messages, 
+    { role: "user", content: qs }, 
+    { role: "ai", content: finalMessage.content as string }
+  ];
+  
+  await redis.set(sessionId, JSON.stringify({ 
+    sessionId: sessionId, 
+    messages: updatedMessages 
+  }), 'EX', 60 * 60 * 24 * 7);
+  
   res.json({
     answer: finalMessage.content,
     sources: results.metadatas[0]

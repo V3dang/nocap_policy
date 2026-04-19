@@ -4,14 +4,14 @@ import {
   StateSchema,
   MessagesValue,
   ReducedValue,
-  GraphNode,
-  ConditionalEdgeRouter,
   START,
   END,
+  type GraphNode,
 } from "@langchain/langgraph";
 import { z } from "zod/v4";
 import { SystemMessage, AIMessage } from "@langchain/core/messages";
 import { LEGAL_ANALYST_SYSTEM_PROMPT, GENZ_TRANSLATOR_SYSTEM_PROMPT } from "../prompts/prompts";
+import 'dotenv/config';
 
 const GraphState = new StateSchema({
   messages: MessagesValue,

@@ -1,3 +1,5 @@
+/policy_data
+/uploads
 # dependencies (bun install)
 node_modules
 
