@@ -6,11 +6,20 @@ import fs from 'fs';
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { ChromaClient } from "chromadb";
 import { pipeline } from '@xenova/transformers';
-import { agent } from "./agents/agent_nodes"; 
+import { agent, generateReelScript } from "./agents/agent_nodes"; 
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import 'dotenv/config';
 import { randomUUID } from "crypto";
 import { Redis } from "ioredis"
+import ffmpeg from "fluent-ffmpeg";
+import * as googleTTS from "google-tts-api";
+import path from "path";
+import Groq from "groq-sdk";
+import { ElevenLabsClient, play } from '@elevenlabs/elevenlabs-js';
+
+const elevenlabs = new ElevenLabsClient();
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const redis = new Redis()
 
@@ -136,6 +145,120 @@ app.post("/api/ask", async (req, res) => {
     sources: results.metadatas[0]
   });
 })
+
+function formatTime(seconds: number) {
+  const date = new Date(seconds * 1000);
+  const hh = String(date.getUTCHours()).padStart(2, '0');
+  const mm = String(date.getUTCMinutes()).padStart(2, '0');
+  const ss = String(date.getUTCSeconds()).padStart(2, '0');
+  const ms = String(date.getUTCMilliseconds()).padStart(3, '0');
+  return `${hh}:${mm}:${ss},${ms}`;
+}
+
+function generateSRT(segments: any[]) {
+  return segments.map((seg, i) => {
+      return `${i + 1}\n${formatTime(seg.start)} --> ${formatTime(seg.end)}\n${seg.text.trim()}\n`;
+  }).join('\n');
+}
+
+app.post("/api/reel", async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).send("Provide a sessionId bro");
+  
+  const sessionString = await redis.get(sessionId);
+  if (!sessionString) return res.status(404).send("Session not found");
+  
+  console.log("1. Fetching policy context from Chroma...");
+  const collection = await client.getCollection({ name: "nocap_policy" });
+  const results = await collection.query({
+  queryEmbeddings: [Array(384).fill(0)], 
+    nResults: 5,
+    where: { "sessionId": sessionId }
+  });
+  const retrievedContext = results.documents[0]?.join("\n\n") || "No info found.";
+  
+  console.log("2. Generating Brainrot Script via Agent Nodes...");
+
+  const script = await generateReelScript(retrievedContext);
+  
+  console.log("3. Generating TTS Audio...");
+  const elevenLabsResponse = await elevenlabs.textToSpeech.convert(
+    'JBFqnCBsd6RMkjVDRZzb',
+    {
+      text: script,
+      modelId: 'eleven_turbo_v2',
+      outputFormat:  'mp3_44100_128',
+    }
+  )
+  
+  const audioChunks = [];
+    for await (const chunk of elevenLabsResponse) {
+      audioChunks.push(chunk);
+    }
+    const audioBuffer = Buffer.concat(audioChunks);
+    console.log(`[Debug] Audio saved: ${audioBuffer.length} bytes`);
+  
+  const tempAudioPath = path.resolve(__dirname, `uploads/audio_${sessionId}.mp3`);
+  fs.writeFileSync(tempAudioPath, audioBuffer);
+  
+  console.log("4. Transcribing with Groq Whisper for Timestamps...");
+      // We ask Groq for "verbose_json" so it gives us the exact start/end time of every phrase
+  const transcription = await groq.audio.transcriptions.create({
+    file: fs.createReadStream(tempAudioPath),
+    model: "whisper-large-v3-turbo",
+    response_format: "verbose_json", 
+  });
+  
+  console.log("5. Generating .srt Subtitle File...");
+  const srtContent = generateSRT(transcription.segments);
+  const srtPath = path.resolve(__dirname, `uploads/captions_${sessionId}.srt`);
+  fs.writeFileSync(srtPath, srtContent);
+  
+  console.log("6. Forging the Brainrot Reel with Dynamic Captions...");
+  const inputVideo = path.resolve(__dirname, 'minecraft_parkour.mp4');
+  const outputVideo = path.resolve(__dirname, `uploads/reel_${sessionId}.mp4`);
+  
+  ffmpeg()
+    .input(inputVideo)
+    .input(tempAudioPath)
+    .complexFilter([
+    `subtitles=uploads/captions_${sessionId}.srt:force_style='Alignment=2,MarginV=80,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Shadow=0,Bold=1'`
+    ])
+    .outputOptions([
+      '-map 0:v', 
+      '-map 1:a', 
+      '-shortest', 
+      '-c:v libx264', 
+      '-c:a aac', 
+      '-y' 
+    ])
+    .save(outputVideo)
+    .on('end', () => {
+    console.log("W! Dynamic Reel generated successfully.");
+    
+    fs.unlinkSync(tempAudioPath);
+    fs.unlinkSync(srtPath);
+  
+    res.json({
+      message: "Reel forged",
+      script: script,
+      videoUrl: `/api/download/reel_${sessionId}.mp4`
+    });
+  })
+  .on('error', (err) => {
+    console.error("FFmpeg Error:", err);
+    res.status(500).send("Error rendering video");
+  });
+})
+
+app.get("/api/download/:filename", (req, res) => {
+  const file = path.resolve(__dirname, `uploads/${req.params.filename}`);
+  
+  if (!fs.existsSync(file)) {
+      return res.status(404).send("Reel not found on server.");
+  }
+  res.sendFile(file);
+});
 
 app.listen(port, () => {
   console.log(`Listening on port ${port}...`);

@@ -10,7 +10,7 @@ import {
 } from "@langchain/langgraph";
 import { z } from "zod/v4";
 import { SystemMessage, AIMessage } from "@langchain/core/messages";
-import { LEGAL_ANALYST_SYSTEM_PROMPT, GENZ_TRANSLATOR_SYSTEM_PROMPT } from "../prompts/prompts";
+import { LEGAL_ANALYST_SYSTEM_PROMPT, GENZ_TRANSLATOR_SYSTEM_PROMPT, REEL_SCRIPT_PROMPT } from "../prompts/prompts";
 import 'dotenv/config';
 
 const GraphState = new StateSchema({
@@ -69,3 +69,11 @@ export const agent = new StateGraph(GraphState)
   .addEdge("LegalAnalyst", "SlangTranslator")
   .addEdge("SlangTranslator", END)
   .compile();
+
+export const generateReelScript = async (context: string) => {
+  const prompt = REEL_SCRIPT_PROMPT.replace("{context}", context)
+  const response = await translatormodel.invoke([
+    new SystemMessage(prompt)
+  ])
+  return response.content as string
+}
