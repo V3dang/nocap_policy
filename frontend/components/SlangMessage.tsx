@@ -10,8 +10,10 @@ type SlangMessageProps = {
 
 export default function SlangMessage({ text, isAI = false }: SlangMessageProps) {
   const copyToClipboard = async () => {
-    if (!isAI) return;
-    await navigator.clipboard.writeText(text);
+    if (!isAI || typeof window === "undefined") return;
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+    }
   };
 
   if (!isAI) {

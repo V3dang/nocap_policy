@@ -1,3 +1,5 @@
+import { fileURLToPath } from "url";
+import path from "path";
 import express from "express";
 import multer from "multer";
 // import { PDFParse } from "pdf-parse"; 
@@ -6,27 +8,40 @@ import fs from 'fs';
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { ChromaClient } from "chromadb";
 import { pipeline } from '@xenova/transformers';
-import { agent, generateReelScript } from "./agents/agent_nodes"; 
+import { agent, generateReelScript, extractPolicyStats } from "./agents/agent_nodes"; 
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import 'dotenv/config';
 import { randomUUID } from "crypto";
 import { Redis } from "ioredis"
 import ffmpeg from "fluent-ffmpeg";
 import * as googleTTS from "google-tts-api";
-import path from "path";
 import Groq from "groq-sdk";
 import { ElevenLabsClient, play } from '@elevenlabs/elevenlabs-js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const elevenlabs = new ElevenLabsClient();
-
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : new Redis();
 
-const redis = new Redis()
-
-const client = new ChromaClient({ path: "http://localhost:8000" });
-const upload = multer({ 'dest': 'uploads/' })
+const client = new ChromaClient({ host: "localhost", port: 8000, ssl: false });
+const uploadDir = path.resolve(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+const upload = multer({ dest: uploadDir });
 
 const app = express();
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json());
 const port = 8080;
 
@@ -177,9 +192,11 @@ app.post("/api/reel", async (req, res) => {
   });
   const retrievedContext = results.documents[0]?.join("\n\n") || "No info found.";
   
-  console.log("2. Generating Brainrot Script via Agent Nodes...");
-
-  const script = await generateReelScript(retrievedContext);
+  console.log("2. Generating Brainrot Script & Dynamic Stats via Agent Nodes...");
+  const [script, stats] = await Promise.all([
+    generateReelScript(retrievedContext),
+    extractPolicyStats(retrievedContext)
+  ]);
   
   console.log("3. Generating TTS Audio...");
   const elevenLabsResponse = await elevenlabs.textToSpeech.convert(
@@ -192,17 +209,17 @@ app.post("/api/reel", async (req, res) => {
   )
   
   const audioChunks = [];
-    for await (const chunk of elevenLabsResponse) {
-      audioChunks.push(chunk);
-    }
-    const audioBuffer = Buffer.concat(audioChunks);
-    console.log(`[Debug] Audio saved: ${audioBuffer.length} bytes`);
+  for await (const chunk of elevenLabsResponse) {
+    audioChunks.push(chunk);
+  }
+  const audioBuffer = Buffer.concat(audioChunks);
+  console.log(`[Debug] Audio saved: ${audioBuffer.length} bytes`);
   
   const tempAudioPath = path.resolve(__dirname, `uploads/audio_${sessionId}.mp3`);
   fs.writeFileSync(tempAudioPath, audioBuffer);
   
   console.log("4. Transcribing with Groq Whisper for Timestamps...");
-      // We ask Groq for "verbose_json" so it gives us the exact start/end time of every phrase
+  // We ask Groq for "verbose_json" so it gives us the exact start/end time of every phrase
   const transcription = await groq.audio.transcriptions.create({
     file: fs.createReadStream(tempAudioPath),
     model: "whisper-large-v3-turbo",
@@ -210,7 +227,7 @@ app.post("/api/reel", async (req, res) => {
   });
   
   console.log("5. Generating .srt Subtitle File...");
-  const srtContent = generateSRT(transcription.segments);
+  const srtContent = generateSRT((transcription as any).segments || []);
   const srtPath = path.resolve(__dirname, `uploads/captions_${sessionId}.srt`);
   fs.writeFileSync(srtPath, srtContent);
   
@@ -218,11 +235,13 @@ app.post("/api/reel", async (req, res) => {
   const inputVideo = path.resolve(__dirname, 'minecraft_parkour.mp4');
   const outputVideo = path.resolve(__dirname, `uploads/reel_${sessionId}.mp4`);
   
+  const srtPathEscaped = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+
   ffmpeg()
     .input(inputVideo)
     .input(tempAudioPath)
     .complexFilter([
-    `subtitles=uploads/captions_${sessionId}.srt:force_style='Alignment=2,MarginV=80,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Shadow=0,Bold=1'`
+      `subtitles='${srtPathEscaped}':force_style='Alignment=2,MarginV=80,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Shadow=0,Bold=1'`
     ])
     .outputOptions([
       '-map 0:v', 
@@ -234,25 +253,33 @@ app.post("/api/reel", async (req, res) => {
     ])
     .save(outputVideo)
     .on('end', () => {
-    console.log("W! Dynamic Reel generated successfully.");
+      console.log("W! Dynamic Reel generated successfully.");
+      
+      try {
+        if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
+        if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
+      } catch (e) {
+        console.error("Cleanup error:", e);
+      }
     
-    fs.unlinkSync(tempAudioPath);
-    fs.unlinkSync(srtPath);
-  
-    res.json({
-      message: "Reel forged",
-      script: script,
-      videoUrl: `/api/download/reel_${sessionId}.mp4`
+      res.json({
+        message: "Reel forged",
+        script: script,
+        videoUrl: `/api/download/reel_${sessionId}.mp4`,
+        stats: stats
+      });
+    })
+    .on('error', (err) => {
+      console.error("FFmpeg Error:", err);
+      res.status(500).send("Error rendering video");
     });
-  })
-  .on('error', (err) => {
-    console.error("FFmpeg Error:", err);
-    res.status(500).send("Error rendering video");
-  });
-})
+});
+
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 app.get("/api/download/:filename", (req, res) => {
-  const file = path.resolve(__dirname, `uploads/${req.params.filename}`);
+  const filename = path.basename(req.params.filename);
+  const file = path.resolve(__dirname, `uploads/${filename}`);
   
   if (!fs.existsSync(file)) {
       return res.status(404).send("Reel not found on server.");
