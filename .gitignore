@@ -5,6 +5,9 @@ minecraft_parkour.mp4
 node_modules
 
 # output
+.next
+/.next
+/frontend/.next
 out
 dist
 *.tgz
