@@ -1,62 +1,65 @@
-import { ChatGroq } from "@langchain/groq"
+import { ChatGroq } from "@langchain/groq";
 import {
   StateGraph,
-  StateSchema,
-  MessagesValue,
-  ReducedValue,
+  Annotation,
   START,
   END,
-  type GraphNode,
 } from "@langchain/langgraph";
-import { z } from "zod/v4";
-import { SystemMessage, AIMessage } from "@langchain/core/messages";
+import { BaseMessage, SystemMessage, AIMessage } from "@langchain/core/messages";
 import { LEGAL_ANALYST_SYSTEM_PROMPT, GENZ_TRANSLATOR_SYSTEM_PROMPT, REEL_SCRIPT_PROMPT } from "../prompts/prompts";
 import 'dotenv/config';
 
-const GraphState = new StateSchema({
-  messages: MessagesValue,
-  context: z.string().default(""),
-  legalfacts: z.string().default("")
+const GraphState = Annotation.Root({
+  messages: Annotation<BaseMessage[]>({
+    reducer: (x, y) => x.concat(y),
+    default: () => [],
+  }),
+  context: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+    default: () => "",
+  }),
+  legalfacts: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+    default: () => "",
+  }),
 });
 
 const analystmodel = new ChatGroq({
   model: "llama-3.3-70b-versatile",
   temperature: 0,
-})
+});
 
 const translatormodel = new ChatGroq({
   model: "llama-3.3-70b-versatile",
   temperature: 0.7
-})
+});
 
-const LegalAnalystNode: GraphNode<typeof GraphState> = async (state) => {
-  const prompt = LEGAL_ANALYST_SYSTEM_PROMPT.replace("{context}", state.context)
+const LegalAnalystNode = async (state: typeof GraphState.State) => {
+  const prompt = LEGAL_ANALYST_SYSTEM_PROMPT.replace("{context}", state.context);
   const latestmessage = state.messages.at(-1);
   const messagesToPass = latestmessage ? [new SystemMessage(prompt), latestmessage] : [new SystemMessage(prompt)];
   const response = await analystmodel.invoke(messagesToPass);
   return {
     legalfacts: response.content as string
   };
-}
+};
 
-const SlangTranslatorNode: GraphNode<typeof GraphState> = async (state) => {
-  const prompt = GENZ_TRANSLATOR_SYSTEM_PROMPT
-  const facts = state.legalfacts
+const SlangTranslatorNode = async (state: typeof GraphState.State) => {
+  const prompt = GENZ_TRANSLATOR_SYSTEM_PROMPT;
+  const facts = state.legalfacts;
   if (facts.includes("INFORMATION_NOT_FOUND")) {
     return {
       messages: [new AIMessage("Bro, I scanned the paperwork and that's literally not in your policy, no cap. You're cooked if you try to claim that without checking with your provider.")]
-    }
+    };
   }
   const response = await translatormodel.invoke([
-    new SystemMessage(
-      prompt,
-    ),
+    new SystemMessage(prompt),
     new SystemMessage(`Here are the raw facts to translate:\n${facts}`)
-  ])
+  ]);
   return {
     messages: [response]
-  }
-}
+  };
+};
 
 export const agent = new StateGraph(GraphState)
   .addNode("LegalAnalyst", LegalAnalystNode)
@@ -67,12 +70,12 @@ export const agent = new StateGraph(GraphState)
   .compile();
 
 export const generateReelScript = async (context: string) => {
-  const prompt = REEL_SCRIPT_PROMPT.replace("{context}", context)
+  const prompt = REEL_SCRIPT_PROMPT.replace("{context}", context);
   const response = await translatormodel.invoke([
     new SystemMessage(prompt)
-  ])
-  return response.content as string
-}
+  ]);
+  return response.content as string;
+};
 
 export const extractPolicyStats = async (context: string) => {
   const prompt = `Analyze this insurance policy text and extract or evaluate the following 3 metrics:
