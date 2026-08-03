@@ -1,15 +1,17 @@
 # NoCap Policy
 **Privacy-first insurance policy explanation using Gen Z slang and agentic RAG.**
 
-NoCap Policy bridges the gap between dense financial jargon and the younger generation. It uses a multi-agent system to extract accurate facts from insurance documents and translate them into digestible, slang-infused insights.
+NoCap Policy bridges the gap between dense financial jargon and the younger generation. It uses a multi-agent system to extract accurate facts from insurance documents and translate them into digestible, slang-infused insights paired with viral 9:16 short-form video reels.
 
 ## Tech Stack
-* **Runtime:** Bun
+* **Frontend:** Next.js, React, Tailwind CSS, Framer Motion
+* **Runtime / Backend:** Node.js / Bun, Express
 * **Orchestration:** LangGraph (Multi-agent workflow)
 * **LLM:** Groq (Llama 3.3 70B)
-* **Vector Database:** ChromaDB (Local persistence)
-* **Session Storage:** Redis (Persistent chat history)
-* **Local Embeddings:** Xenova/bge-small-en-v1.5 (CPU-based)
+* **Vector Database:** ChromaDB
+* **Session Storage:** Redis
+* **Local Embeddings:** Xenova/bge-small-en-v1.5
+* **Media & TTS:** FFmpeg, ElevenLabs, Groq Whisper
 
 ## Infrastructure Setup
 1. **ChromaDB:**
@@ -21,20 +23,26 @@ NoCap Policy bridges the gap between dense financial jargon and the younger gene
    sudo service redis-server start
    ```
 3. **Environment:**
-   Create a `.env` file:
+   Create a `.env` file in root:
    ```env
    GROQ_API_KEY=your_groq_api_key
+   ELEVENLABS_API_KEY=your_elevenlabs_api_key
    ```
 
 ## Installation & Running
-1. **Install dependencies:**
-   ```bash
-   bun install
-   ```
-2. **Start the server:**
-   ```bash
-   npx tsx index.ts
-   ```
+
+### 1. Backend Server
+```bash
+bun install
+npx tsx index.ts
+```
+
+### 2. Frontend Web App
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
 ## API Documentation
 
@@ -42,12 +50,16 @@ NoCap Policy bridges the gap between dense financial jargon and the younger gene
 * **Endpoint:** `/api/upload`
 * **Method:** `POST`
 * **Body:** `form-data` with key `policy` (PDF file)
-* **Response:** Returns a `sessionId` required for queries.
 
-### 2. Ask Questions
+### 2. Generate Reel
+* **Endpoint:** `/api/reel`
+* **Method:** `POST`
+* **Body:** `{"sessionId": "your-session-uuid"}`
+
+### 3. Ask Questions
 * **Endpoint:** `/api/ask`
 * **Method:** `POST`
-* **Body:** JSON
+* **Body:**
   ```json
   {
     "qs": "What is my deductible?",
@@ -55,13 +67,6 @@ NoCap Policy bridges the gap between dense financial jargon and the younger gene
   }
   ```
 
-## Agent Architecture
-The system uses a stateful graph to separate logic:
-1. **Retriever:** Fetches context from ChromaDB using metadata filters.
-2. **Legal Analyst:** Extract dry, immutable facts from the retrieved text.
-3. **Slang Translator:** Converts facts into Gen Z slang while maintaining accuracy.
-
 ## Data Privacy
-* All document embedding is performed locally on the host machine.
-* Data is filtered by `sessionId` at the database level to prevent cross-user leakage.
-* Groq API calls utilize Llama-3.3-70b-versatile with a zero-data-retention focus.
+* Document embeddings are computed on host machine.
+* Data is isolated per `sessionId` at the vector database layer.
